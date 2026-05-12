@@ -428,15 +428,14 @@ _model: nn.Module = None
 _classes: list    = []
 
 def download_model():
-    """Descarga el modelo desde Google Drive si no existe localmente."""
-    gdrive_id = os.environ.get("MODEL_GDRIVE_ID", "")
-    if not gdrive_id:
-        print("[WARN] Variable MODEL_GDRIVE_ID no configurada.")
-        return
+    """Descarga el modelo desde Hugging Face Hub."""
+    model_url = os.environ.get(
+        "MODEL_URL",
+        "https://huggingface.co/Crth/RAZZAS/resolve/main/dog_classifier.pth"
+    )
     MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    url = f"https://drive.google.com/uc?export=download&id={gdrive_id}"
-    print(f"[MODEL] Descargando modelo desde Google Drive...")
-    urllib.request.urlretrieve(url, MODEL_PATH)
+    print(f"[MODEL] Descargando modelo desde Hugging Face...")
+    urllib.request.urlretrieve(model_url, MODEL_PATH)
     print(f"[MODEL] Descarga completa: {MODEL_PATH}")
 
 def load_model():
@@ -609,23 +608,6 @@ def get_confusion():
         data = base64.b64encode(f.read()).decode()
     return {"image_base64": data, "format": "png"}
 
-
-# ─────────────────────────────────────────────
-# DESCARGA DE MODELO PREENTRENADO 
-# ─────────────────────────────────────────────
-
-def download_model():
-    """Descarga el modelo desde Google Drive si no existe localmente."""
-    gdrive_id = os.environ.get("MODEL_GDRIVE_ID", "")
-    if not gdrive_id:
-        print("[WARN] Variable MODEL_GDRIVE_ID no configurada.")
-        return
-    MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    # ✅ &confirm=t fuerza la descarga en archivos grandes
-    url = f"https://drive.google.com/uc?export=download&id={gdrive_id}&confirm=t"
-    print(f"[MODEL] Descargando modelo desde Google Drive...")
-    urllib.request.urlretrieve(url, MODEL_PATH)
-    print(f"[MODEL] Descarga completa: {MODEL_PATH}")
 
 # ─────────────────────────────────────────────
 # ENTRY POINT
