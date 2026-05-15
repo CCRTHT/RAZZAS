@@ -21,6 +21,7 @@ import os, json, time, io, base64
 from pathlib import Path
 from datetime import datetime
 
+import urllib.request
 import numpy as np
 import torch
 import torch.nn as nn
@@ -474,13 +475,27 @@ def generate_gradcam(model: nn.Module, img_tensor: torch.Tensor,
 # ─────────────────────────────────────────────
 # CARGA DEL MODELO EN MEMORIA
 # ─────────────────────────────────────────────
+                       
 _model: nn.Module = None
 _classes: list    = []
+
+def download_model():
+    """Descarga el modelo desde Hugging Face Hub."""
+    model_url = os.environ.get(
+        "MODEL_URL",
+        "https://huggingface.co/Crth/RAZZAS/resolve/main/dog_classifier.pth"
+    )
+    MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    print(f"[MODEL] Descargando modelo desde Hugging Face...")
+    urllib.request.urlretrieve(model_url, MODEL_PATH)
+    print(f"[MODEL] Descarga completa: {MODEL_PATH}")
 
 def load_model():
     global _model, _classes
     if not MODEL_PATH.exists():
-        print("[WARN] Modelo no encontrado. Ejecuta primero el entrenamiento.")
+        download_model()
+    if not MODEL_PATH.exists():
+        print("[WARN] Modelo no encontrado tras intento de descarga.")
         return False
     ckpt = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
     _classes = ckpt["classes"]
@@ -499,54 +514,19 @@ def preprocess_image(image_bytes: bytes) -> tuple:
 
 
 @torch.no_grad()
-def predict_image(img_tensor: torch.Tensor, orig_img: Image.Image,
-                  top_k: int = 5, use_tta: bool = True) -> tuple:
-    """
-    Retorna (lista de {breed, confidence}, flag_low_confidence).
-    Con TTA activado promedia múltiples vistas para mayor precisión.
-    """
-    CONFIDENCE_THRESHOLD = 0.30  # Si el top-1 está por debajo → advertencia
-
-    if use_tta:
-        all_probs = []
-
-        # Vista 1: estándar
-        out = _model(img_tensor.unsqueeze(0).to(DEVICE))
-        all_probs.append(torch.softmax(out, dim=1)[0])
-
-        # Vista 2: crop centrado con padding
-        t2 = tta_transforms[1](orig_img)
-        out2 = _model(t2.unsqueeze(0).to(DEVICE))
-        all_probs.append(torch.softmax(out2, dim=1)[0])
-
-        # Vista 3: flip horizontal
-        t3 = tta_transforms[2](orig_img)
-        out3 = _model(t3.unsqueeze(0).to(DEVICE))
-        all_probs.append(torch.softmax(out3, dim=1)[0])
-
-        # Vista 4: 5 recortes promediados
-        t4 = tta_transforms[3](orig_img)   # shape: [5, C, H, W]
-        out4 = _model(t4.to(DEVICE))        # shape: [5, num_classes]
-        all_probs.append(torch.softmax(out4, dim=1).mean(dim=0))
-
-        # Promedio de todas las vistas (ensemble de TTA)
-        probs = torch.stack(all_probs).mean(dim=0)
-    else:
-        out = _model(img_tensor.unsqueeze(0).to(DEVICE))
-        probs = torch.softmax(out, dim=1)[0]
-
+def predict_image(img_tensor: torch.Tensor, top_k: int = 5) -> list:
+    """Retorna lista de {breed, confidence} ordenada por confianza."""
+    outputs = _model(img_tensor.unsqueeze(0).to(DEVICE))
+    probs   = torch.softmax(outputs, dim=1)[0]
     top_p, top_i = probs.topk(top_k)
     results = []
     for prob, idx in zip(top_p.cpu().numpy(), top_i.cpu().numpy()):
         breed = _classes[idx]
-        # Limpiar nombre: "n02085620-Chihuahua" → "Chihuahua" (con guiones bajos → espacios)
+        # Limpiar nombre: "n02085620-Chihuahua" → "Chihuahua"
         if "-" in breed:
             breed = breed.split("-", 1)[1]
-        breed = breed.replace("_", " ").title()
         results.append({"breed": breed, "confidence": round(float(prob), 6)})
-
-    low_confidence = results[0]["confidence"] < CONFIDENCE_THRESHOLD
-    return results, low_confidence
+    return results
 
 
 # ─────────────────────────────────────────────
