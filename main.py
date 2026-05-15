@@ -549,7 +549,8 @@ def predict_image(img_tensor: torch.Tensor, orig_img: Image.Image,
     Retorna (lista de {breed, confidence}, flag_low_confidence).
     Con TTA activado promedia múltiples vistas para mayor precisión.
     """
-    CONFIDENCE_THRESHOLD = 0.30  # Si el top-1 está por debajo → advertencia
+    #CONFIDENCE_THRESHOLD = 0.30  # Si el top-1 está por debajo → advertencia
+    CONFIDENCE_THRESHOLD = 0.55  # Si el top-1 está por debajo → advertencia
 
     if use_tta:
         all_probs = []
