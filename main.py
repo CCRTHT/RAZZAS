@@ -18,7 +18,6 @@ Evaluación que realizamos:
 """
 
 import os, json, time, io, base64
-import urllib.request
 from pathlib import Path
 from datetime import datetime
 
@@ -46,6 +45,11 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import uvicorn
+
+# Permitir los tipos de numpy necesarios para cargar checkpoints antiguos
+torch.serialization.add_safe_globals([
+    np._core.multiarray.scalar
+])
 
 # ─────────────────────────────────────────────
 # CONFIGURACION
@@ -77,14 +81,17 @@ for d in [MODEL_PATH.parent, ACTIVATIONS_DIR]:
 # TRANSFORMS
 # ─────────────────────────────────────────────
 train_transform = transforms.Compose([
-    transforms.Resize((IMG_SIZE + 20, IMG_SIZE + 20)),
+    transforms.Resize((IMG_SIZE + 32, IMG_SIZE + 32)),
     transforms.RandomCrop(IMG_SIZE),
     transforms.RandomHorizontalFlip(),
-    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
-    transforms.RandomRotation(15),
+    transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05),
+    transforms.RandomRotation(20),
+    transforms.RandomPerspective(distortion_scale=0.2, p=0.3),
+    transforms.RandomGrayscale(p=0.05),
     transforms.ToTensor(),
     transforms.Normalize([0.485, 0.456, 0.406],
                          [0.229, 0.224, 0.225]),
+    transforms.RandomErasing(p=0.2, scale=(0.02, 0.1)),  # Simula oclusiones
 ])
 
 val_transform = transforms.Compose([
@@ -93,6 +100,37 @@ val_transform = transforms.Compose([
     transforms.Normalize([0.485, 0.456, 0.406],
                          [0.229, 0.224, 0.225]),
 ])
+
+# ── TTA (Test-Time Augmentation) ──────────────────────────────
+# Varias vistas de la imagen se promedian para mayor precisión
+tta_transforms = [
+    transforms.Compose([
+        transforms.Resize((IMG_SIZE, IMG_SIZE)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ]),
+    transforms.Compose([
+        transforms.Resize((IMG_SIZE + 20, IMG_SIZE + 20)),
+        transforms.CenterCrop(IMG_SIZE),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ]),
+    transforms.Compose([
+        transforms.Resize((IMG_SIZE, IMG_SIZE)),
+        transforms.RandomHorizontalFlip(p=1.0),   # siempre flipped
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ]),
+    transforms.Compose([
+        transforms.Resize((IMG_SIZE + 10, IMG_SIZE + 10)),
+        transforms.FiveCrop(IMG_SIZE),             # 5 recortes (centro + esquinas)
+        transforms.Lambda(lambda crops: torch.stack([
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])(
+                transforms.ToTensor()(c)
+            ) for c in crops
+        ])),
+    ]),
+]
 
 # ─────────────────────────────────────────────
 # MODELO: EfficientNetB3 (Transfer Learning)
@@ -109,19 +147,24 @@ def build_model(num_classes: int) -> nn.Module:
     for param in model.parameters():
         param.requires_grad = False
 
-    # Reemplazar clasificador final
+    # Reemplazar clasificador final (más profundo y robusto)
     in_features = model.classifier[1].in_features
     model.classifier = nn.Sequential(
         nn.Dropout(p=0.4, inplace=True),
-        nn.Linear(in_features, 512),
-        nn.ReLU(inplace=True),
-        nn.Dropout(p=0.3),
+        nn.Linear(in_features, 1024),
+        nn.BatchNorm1d(1024),
+        nn.SiLU(inplace=True),          # SiLU/Swish: mejor que ReLU para EfficientNet
+        nn.Dropout(p=0.35),
+        nn.Linear(1024, 512),
+        nn.BatchNorm1d(512),
+        nn.SiLU(inplace=True),
+        nn.Dropout(p=0.25),
         nn.Linear(512, num_classes),
     )
 
-    # Descongelar últimas capas para fine-tuning
+    # Descongelar más capas para mejor fine-tuning (últimas 5 en lugar de 3)
     layers = list(model.features.children())
-    for layer in layers[-3:]:
+    for layer in layers[-5:]:
         for param in layer.parameters():
             param.requires_grad = True
 
@@ -180,10 +223,17 @@ def train_model():
     test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
 
     model     = build_model(num_classes)
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.15)  # 0.15 reduce sobreajuste
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),
-                            lr=LR, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+                            lr=LR, weight_decay=2e-4)
+    # Scheduler con warmup: 3 épocas de calentamiento + cosine decay
+    def lr_lambda(epoch):
+        warmup_epochs = 3
+        if epoch < warmup_epochs:
+            return (epoch + 1) / warmup_epochs
+        progress = (epoch - warmup_epochs) / max(1, EPOCHS - warmup_epochs)
+        return 0.5 * (1.0 + np.cos(np.pi * progress))
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     # ── LOOP DE ENTRENAMIENTO ──────────────────
     history = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
@@ -249,7 +299,7 @@ def train_model():
 
     # ── EVALUACIÓN FINAL (TEST SET) ────────────
     print("\n[EVAL] Evaluando en test set...")
-    checkpoint = torch.load(MODEL_PATH, map_location=DEVICE)
+    checkpoint = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
 
@@ -427,23 +477,10 @@ def generate_gradcam(model: nn.Module, img_tensor: torch.Tensor,
 _model: nn.Module = None
 _classes: list    = []
 
-def download_model():
-    """Descarga el modelo desde Hugging Face Hub."""
-    model_url = os.environ.get(
-        "MODEL_URL",
-        "https://huggingface.co/Crth/RAZZAS/resolve/main/dog_classifier.pth"
-    )
-    MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    print(f"[MODEL] Descargando modelo desde Hugging Face...")
-    urllib.request.urlretrieve(model_url, MODEL_PATH)
-    print(f"[MODEL] Descarga completa: {MODEL_PATH}")
-
 def load_model():
     global _model, _classes
     if not MODEL_PATH.exists():
-        download_model()
-    if not MODEL_PATH.exists():
-        print("[WARN] Modelo no encontrado tras intento de descarga.")
+        print("[WARN] Modelo no encontrado. Ejecuta primero el entrenamiento.")
         return False
     ckpt = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
     _classes = ckpt["classes"]
@@ -462,19 +499,54 @@ def preprocess_image(image_bytes: bytes) -> tuple:
 
 
 @torch.no_grad()
-def predict_image(img_tensor: torch.Tensor, top_k: int = 5) -> list:
-    """Retorna lista de {breed, confidence} ordenada por confianza."""
-    outputs = _model(img_tensor.unsqueeze(0).to(DEVICE))
-    probs   = torch.softmax(outputs, dim=1)[0]
+def predict_image(img_tensor: torch.Tensor, orig_img: Image.Image,
+                  top_k: int = 5, use_tta: bool = True) -> tuple:
+    """
+    Retorna (lista de {breed, confidence}, flag_low_confidence).
+    Con TTA activado promedia múltiples vistas para mayor precisión.
+    """
+    CONFIDENCE_THRESHOLD = 0.30  # Si el top-1 está por debajo → advertencia
+
+    if use_tta:
+        all_probs = []
+
+        # Vista 1: estándar
+        out = _model(img_tensor.unsqueeze(0).to(DEVICE))
+        all_probs.append(torch.softmax(out, dim=1)[0])
+
+        # Vista 2: crop centrado con padding
+        t2 = tta_transforms[1](orig_img)
+        out2 = _model(t2.unsqueeze(0).to(DEVICE))
+        all_probs.append(torch.softmax(out2, dim=1)[0])
+
+        # Vista 3: flip horizontal
+        t3 = tta_transforms[2](orig_img)
+        out3 = _model(t3.unsqueeze(0).to(DEVICE))
+        all_probs.append(torch.softmax(out3, dim=1)[0])
+
+        # Vista 4: 5 recortes promediados
+        t4 = tta_transforms[3](orig_img)   # shape: [5, C, H, W]
+        out4 = _model(t4.to(DEVICE))        # shape: [5, num_classes]
+        all_probs.append(torch.softmax(out4, dim=1).mean(dim=0))
+
+        # Promedio de todas las vistas (ensemble de TTA)
+        probs = torch.stack(all_probs).mean(dim=0)
+    else:
+        out = _model(img_tensor.unsqueeze(0).to(DEVICE))
+        probs = torch.softmax(out, dim=1)[0]
+
     top_p, top_i = probs.topk(top_k)
     results = []
     for prob, idx in zip(top_p.cpu().numpy(), top_i.cpu().numpy()):
         breed = _classes[idx]
-        # Limpiar nombre: "n02085620-Chihuahua" → "Chihuahua"
+        # Limpiar nombre: "n02085620-Chihuahua" → "Chihuahua" (con guiones bajos → espacios)
         if "-" in breed:
             breed = breed.split("-", 1)[1]
+        breed = breed.replace("_", " ").title()
         results.append({"breed": breed, "confidence": round(float(prob), 6)})
-    return results
+
+    low_confidence = results[0]["confidence"] < CONFIDENCE_THRESHOLD
+    return results, low_confidence
 
 
 # ─────────────────────────────────────────────
@@ -544,7 +616,7 @@ async def predict(file: UploadFile = File(...)):
     t0 = time.perf_counter()
     try:
         img_tensor, orig_img = preprocess_image(contents)
-        predictions          = predict_image(img_tensor, top_k=5)
+        predictions, low_confidence = predict_image(img_tensor, orig_img, top_k=5)
     except Exception as e:
         raise HTTPException(500, f"Error procesando imagen: {e}")
 
@@ -564,8 +636,11 @@ async def predict(file: UploadFile = File(...)):
         "predictions":       predictions,
         "top_breed":         predictions[0]["breed"],
         "top_confidence":    predictions[0]["confidence"],
+        "low_confidence":    low_confidence,          # True → resultado poco confiable
+        "warning":           "Confianza baja: la imagen puede no ser un perro o la raza es ambigua." if low_confidence else None,
         "gradcam_base64":    gradcam_b64,
         "inference_ms":      elapsed_ms,
+        "tta_enabled":       True,
     }
 
 
