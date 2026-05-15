@@ -21,7 +21,6 @@ import os, json, time, io, base64
 from pathlib import Path
 from datetime import datetime
 
-import urllib.request
 import numpy as np
 import torch
 import torch.nn as nn
@@ -64,6 +63,9 @@ CONFUSION_PATH= BASE_DIR / "model" / "confusion_matrix.png"
 ACTIVATIONS_DIR = BASE_DIR / "activations"
 CLASSES_PATH  = BASE_DIR / "model" / "classes.json"
 
+# URL del modelo en HuggingFace (usado al desplegar en Railway)
+MODEL_HF_URL  = "https://huggingface.co/Crth/RAZZAS/resolve/main/dog_classifier.pth"
+
 IMG_SIZE      = 300          # EfficientNetB3 input
 BATCH_SIZE    = 32
 EPOCHS        = 25
@@ -77,6 +79,43 @@ NUM_CLASSES   = 120          # Stanford Dogs
 # ─────────────────────────────────────────────
 for d in [MODEL_PATH.parent, ACTIVATIONS_DIR]:
     d.mkdir(parents=True, exist_ok=True)
+
+# ─────────────────────────────────────────────
+# DESCARGA AUTOMÁTICA DEL MODELO DESDE HUGGINGFACE
+# ─────────────────────────────────────────────
+def download_model_if_needed():
+    """
+    Si el modelo no existe localmente, lo descarga desde HuggingFace.
+    Útil para despliegues en Railway donde el .pth no está en el repo.
+    """
+    if MODEL_PATH.exists():
+        print(f"[MODEL] Modelo encontrado localmente: {MODEL_PATH}")
+        return
+
+    print(f"[MODEL] Modelo no encontrado. Descargando desde HuggingFace...")
+    print(f"[MODEL] URL: {MODEL_HF_URL}")
+
+    try:
+        import urllib.request
+
+        def _reporthook(count, block_size, total_size):
+            if total_size > 0:
+                percent = min(int(count * block_size * 100 / total_size), 100)
+                mb_done = count * block_size / (1024 * 1024)
+                mb_total = total_size / (1024 * 1024)
+                print(f"\r[MODEL] Descargando: {percent}% ({mb_done:.1f}/{mb_total:.1f} MB)", end="", flush=True)
+
+        MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+        urllib.request.urlretrieve(MODEL_HF_URL, MODEL_PATH, reporthook=_reporthook)
+        print(f"\n[MODEL] ✓ Descarga completada: {MODEL_PATH}")
+
+    except Exception as e:
+        print(f"\n[ERROR] No se pudo descargar el modelo: {e}")
+        raise RuntimeError(
+            f"Fallo al descargar el modelo desde HuggingFace.\n"
+            f"URL: {MODEL_HF_URL}\n"
+            f"Error: {e}"
+        )
 
 # ─────────────────────────────────────────────
 # TRANSFORMS
@@ -475,16 +514,15 @@ def generate_gradcam(model: nn.Module, img_tensor: torch.Tensor,
 # ─────────────────────────────────────────────
 # CARGA DEL MODELO EN MEMORIA
 # ─────────────────────────────────────────────
-                       
 _model: nn.Module = None
 _classes: list    = []
- 
+
 def load_model():
     global _model, _classes
- 
+
     # ── Descarga automática desde HuggingFace si no existe localmente ──
     download_model_if_needed()
- 
+
     if not MODEL_PATH.exists():
         print("[WARN] Modelo no encontrado. Ejecuta primero el entrenamiento.")
         return False
@@ -495,15 +533,15 @@ def load_model():
     _model.eval()
     print(f"[MODEL] Cargado: {len(_classes)} razas · {DEVICE}")
     return True
- 
- 
+
+
 def preprocess_image(image_bytes: bytes) -> tuple:
     """Retorna (tensor normalizado, imagen PIL original)."""
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     tensor = val_transform(img)
     return tensor, img
- 
- 
+
+
 @torch.no_grad()
 def predict_image(img_tensor: torch.Tensor, orig_img: Image.Image,
                   top_k: int = 5, use_tta: bool = True) -> tuple:
@@ -512,35 +550,35 @@ def predict_image(img_tensor: torch.Tensor, orig_img: Image.Image,
     Con TTA activado promedia múltiples vistas para mayor precisión.
     """
     CONFIDENCE_THRESHOLD = 0.30  # Si el top-1 está por debajo → advertencia
- 
+
     if use_tta:
         all_probs = []
- 
+
         # Vista 1: estándar
         out = _model(img_tensor.unsqueeze(0).to(DEVICE))
         all_probs.append(torch.softmax(out, dim=1)[0])
- 
+
         # Vista 2: crop centrado con padding
         t2 = tta_transforms[1](orig_img)
         out2 = _model(t2.unsqueeze(0).to(DEVICE))
         all_probs.append(torch.softmax(out2, dim=1)[0])
- 
+
         # Vista 3: flip horizontal
         t3 = tta_transforms[2](orig_img)
         out3 = _model(t3.unsqueeze(0).to(DEVICE))
         all_probs.append(torch.softmax(out3, dim=1)[0])
- 
+
         # Vista 4: 5 recortes promediados
         t4 = tta_transforms[3](orig_img)   # shape: [5, C, H, W]
         out4 = _model(t4.to(DEVICE))        # shape: [5, num_classes]
         all_probs.append(torch.softmax(out4, dim=1).mean(dim=0))
- 
+
         # Promedio de todas las vistas (ensemble de TTA)
         probs = torch.stack(all_probs).mean(dim=0)
     else:
         out = _model(img_tensor.unsqueeze(0).to(DEVICE))
         probs = torch.softmax(out, dim=1)[0]
- 
+
     top_p, top_i = probs.topk(top_k)
     results = []
     for prob, idx in zip(top_p.cpu().numpy(), top_i.cpu().numpy()):
@@ -550,10 +588,9 @@ def predict_image(img_tensor: torch.Tensor, orig_img: Image.Image,
             breed = breed.split("-", 1)[1]
         breed = breed.replace("_", " ").title()
         results.append({"breed": breed, "confidence": round(float(prob), 6)})
- 
+
     low_confidence = results[0]["confidence"] < CONFIDENCE_THRESHOLD
     return results, low_confidence
- 
 
 
 # ─────────────────────────────────────────────
@@ -700,7 +737,7 @@ if __name__ == "__main__":
     parser.add_argument("--train",  action="store_true",
                         help="Entrenar el modelo desde cero")
     parser.add_argument("--host",   default="0.0.0.0")
-    parser.add_argument("--port",   type=int, default=8000)
+    parser.add_argument("--port",   type=int, default=int(os.environ.get("PORT", 8000)))
     args = parser.parse_args()
 
     if args.train:
